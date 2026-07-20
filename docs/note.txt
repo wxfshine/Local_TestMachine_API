@@ -1,0 +1,1 @@
+Release\AutoTestCopilot.CLI.exe --cases Release\Resources\a.xlsx
