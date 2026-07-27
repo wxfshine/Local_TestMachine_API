@@ -30,10 +30,11 @@
 **（1）安装 Python 依赖**
 
 ```bash
-pip install fastapi uvicorn keyring
+pip install fastapi uvicorn keyring python-dotenv
 ```
 
-> `keyring` 用于从 Windows 凭据管理器读取 FTP 密码。
+> - `keyring` 用于从 Windows 凭据管理器读取 FTP 密码。
+> - `python-dotenv` 用于加载 `.env` 文件中的邮件通知配置。
 
 **（2）配置 FTP 密码到 Windows 凭据管理器**
 
@@ -108,9 +109,62 @@ D:\CMGE Copilot Store\
 └── temp\                         # FTP 下载临时目录（安装完成后自动清理）
 ```
 
-## 4. API 接口
+## 4. 邮件通知配置（被调用时自动发邮件）
 
-### 4.1 触发自动化测试（含 FTP 自动更新）
+为了在联调期间能立即确认 API 是否被调用，服务在每次接到请求时会**异步**发送一封通知邮件，告知调用时间、调用方 IP、User-Agent、请求体等。
+
+### 4.1 复制配置模板
+
+```bash
+# 在项目根目录下执行
+copy .env.example .env
+```
+
+### 4.2 编辑 `.env` 填写真实值
+
+`.env` 文件内容示例（已包含在本项目 `.gitignore` 中，不会被提交）：
+
+```env
+# 发件邮箱
+EMAIL_FROM=wangxf@cmgos.com
+# 收件邮箱（多个用英文逗号分隔）
+EMAIL_TO=wangxf@cmgos.com
+# SMTP 服务器地址
+SMTP_HOST=mail.cmgos.com
+# SMTP 端口（公司内网使用 25 端口明文连接）
+SMTP_PORT=25
+# SMTP 用户名
+SMTP_USER=wangxf@cmgos.com
+# SMTP 密码
+SMTP_PASSWORD=~!@#QW0707
+```
+
+### 4.3 邮件内容说明
+
+收到请求后会自动发送主题类似：
+
+```text
+[AutoTestAPI] 触发通知 | 2026-07-17 22:30:15 | IP=10.0.0.123
+```
+
+邮件正文（HTML + 纯文本双格式）包含：
+
+- 调用时间（精确到秒）
+- 本机主机名
+- 调用方 IP（优先取 `X-Forwarded-For`，回退到 `request.client.host`）
+- HTTP 方法、请求路径
+- User-Agent
+- 完整的请求体 `task_info`（JSON 格式化展示）
+
+### 4.4 行为说明
+
+- 邮件发送在**后台线程**中执行，**不会阻塞**接口响应。
+- 邮件发送失败仅记录日志，**不影响**业务执行（互斥锁、FTP 更新、CLI 测试等流程不会因邮件问题而中断）。
+- 如果 `.env` 配置缺失，会在 `D:\auto_test_api\trigger_run.log` 中写入 `邮件配置不完整，跳过发送` 警告，业务不受影响。
+
+## 5. API 接口
+
+### 5.1 触发自动化测试（含 FTP 自动更新）
 
 **接口地址**：`POST /api/trigger/auto-test`
 
@@ -238,7 +292,7 @@ Content-Type: application/json
 | `3` | 初始化失败，运行环境未就绪 |
 | `5` | 执行过程中出现未处理异常 |
 
-## 5. FTP 自动更新机制
+## 6. FTP 自动更新机制
 
 ### 5.1 FTP 连接配置
 
@@ -334,7 +388,7 @@ FTP 远程目录下的版本文件夹命名格式为：
 | 安装后验证文件不存在 | 返回 code=-20，终止流程 |
 | `latest Version.txt` 写入失败 | 仅记录日志警告，不终止流程 |
 
-## 6. 完整请求处理流程
+## 7. 完整请求处理流程
 
 ```
 POST /api/trigger/auto-test
@@ -378,7 +432,7 @@ POST /api/trigger/auto-test
   └─ 释放互斥锁
 ```
 
-## 7. 调用示例
+## 8. 调用示例
 
 ### 7.1 默认调用（含 FTP 版本检查）
 
@@ -524,7 +578,7 @@ print(result)
 }
 ```
 
-## 8. 运行前提
+## 9. 运行前提
 
 在使用本服务前，请确保目标机器满足以下条件：
 
@@ -558,7 +612,7 @@ print(result)
 
 11. **版本存储目录**：`D:\CMGE Copilot Store` 存在（服务首次运行时会自动创建 `latest Version.txt`）
 
-## 9. 日志
+## 10. 日志
 
 ### 9.1 服务日志
 
@@ -597,3 +651,4 @@ CLI 自身的运行日志位于：
 7. **FTP 密码安全**：密码存储在 Windows 凭据管理器中，不以明文形式出现在代码或配置文件里。如需更换密码，请通过凭据管理器或 `keyring.set_password()` 更新。
 8. **版本更新与测试的绑定关系**：默认模式下（`skip_update=false`），只有在 FTP 检测到新版本并成功安装后才会执行测试。如果版本相同，API 返回 `code=1` 而不执行测试。如需使用当前已安装版本直接执行测试，请传 `"skip_update": true`。
 9. **升级策略**：当前 MSI 安装采用直接覆盖方式（不先卸载旧版本），该策略由 CMGE Copilot 开发人员保证可行性。如升级时遇到问题，需与开发人员协商调整方案。
+10. **邮件通知**：默认会在每次接到请求时发送一封通知邮件（SMTP 25 端口明文），方便联调期确认 API 是否被调用。配置项在 `.env` 中；邮件发送在后台异步执行，**任何邮件错误都不会影响业务**。如不需要邮件通知，可清空 `.env` 中的配置项，服务会自动跳过发送。

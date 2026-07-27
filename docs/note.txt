@@ -1,1 +1,9 @@
 Release\AutoTestCopilot.CLI.exe --cases Release\Resources\a.xlsx
+
+curl -v --connect-timeout 5 --max-time 10 -X POST http://127.0.0.1:8080/api/v1/product/notify-finish -H "Authorization: Bearer 1qpfMlhdbyyaWE6oXGqh_6xm-3QNt8ea" -H "Content-Type: application/json" -d '{
+  "productId": "PROD-001",
+  "productName": "CMGE Copilot 之改权限为管理员",
+  "developer": "王晓峰",
+  "finishTime": "2026-07-23 23:23:00",
+  "remark": "第一轮测试完成"
+}'

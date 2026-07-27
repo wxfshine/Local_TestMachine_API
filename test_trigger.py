@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 import subprocess
 import logging
 import os
@@ -10,8 +10,32 @@ import threading
 import enum
 from ftplib import FTP_TLS, error_perm, error_temp
 
+import mailer
+
 # ==================== 日志配置 ====================
 LOG_PATH = r"D:\auto_test_api\trigger_run.log"
+SMB_LOG_PATH = r"\\10.0.19.101\共享磁盘\研发测试部 DEV\WangXiaofeng\AutoTestCopilot Log\trigger_run.log"
+
+class SMBLogHandler(logging.Handler):
+    """将日志同时写入本地文件和共享磁盘，共享磁盘不可用时降级为仅本地记录"""
+    def __init__(self, smb_path: str, encoding: str = "utf-8"):
+        super().__init__()
+        self.smb_path = smb_path
+        self.encoding = encoding
+        self.smb_available = True
+
+    def emit(self, record):
+        try:
+            log_entry = self.format(record) + "\n"
+            os.makedirs(os.path.dirname(self.smb_path), exist_ok=True)
+            with open(self.smb_path, "a", encoding=self.encoding) as f:
+                f.write(log_entry)
+            self.smb_available = True
+        except Exception as e:
+            if self.smb_available:
+                logger.warning(f"共享磁盘日志写入失败，将降级为仅本地记录: {e}")
+                self.smb_available = False
+
 logging.basicConfig(
     filename=LOG_PATH,
     level=logging.INFO,
@@ -19,6 +43,7 @@ logging.basicConfig(
     encoding="utf-8"
 )
 logger = logging.getLogger("test-trigger-service")
+logger.addHandler(SMBLogHandler(SMB_LOG_PATH))
 
 # ==================== 路径常量 ====================
 # 以当前脚本所在目录为基准，定位 Release 目录下的 CLI 与用例文件
@@ -179,6 +204,7 @@ def _ftp_get_latest_version(ftp) -> str:
 def _ftp_download_version(ftp, version_folder_name: str) -> str:
     """
     从 FTP 下载指定版本文件夹内的所有文件到本地临时目录。
+    支持递归下载嵌套文件夹结构。
     返回值: 本地下载目录路径
     """
     global _current_stage
@@ -186,21 +212,58 @@ def _ftp_download_version(ftp, version_folder_name: str) -> str:
 
     remote_dir = f"{FTP_REMOTE_BASE_DIR}/{version_folder_name}"
     local_dir = os.path.join(COPILOT_TEMP_DIR, version_folder_name)
-    os.makedirs(local_dir, exist_ok=True)
 
-    ftp.cwd(remote_dir)
-    files = ftp.nlst()
-    logger.info(f"开始下载版本 {version_folder_name}，共 {len(files)} 个文件")
+    logger.info(f"开始下载版本 {version_folder_name}，远程目录: {remote_dir}")
 
-    for filename in files:
-        local_path = os.path.join(local_dir, filename)
-        logger.info(f"正在下载: {filename}")
-        with open(local_path, "wb") as f:
-            ftp.retrbinary(f"RETR {filename}", f.write)
-        logger.info(f"下载完成: {filename} → {local_path}")
+    # 递归下载函数
+    def _download_recursive(ftp_obj, remote_path: str, local_path: str):
+        """递归下载 FTP 目录及其子目录中的所有文件"""
+        try:
+            # 尝试切换到远程路径
+            original_dir = ftp_obj.pwd()
+            ftp_obj.cwd(remote_path)
+            ftp_obj.cwd(original_dir)  # 立即切回原目录
 
-    logger.info(f"版本 {version_folder_name} 全部文件下载完成，本地路径: {local_dir}")
-    return local_dir
+            # 如果 cwd 成功，说明是目录
+            os.makedirs(local_path, exist_ok=True)
+
+            # 列出目录内容
+            items = ftp_obj.nlst(remote_path)
+            # 过滤掉 . 和 .. 避免无限递归
+            items = [item for item in items if os.path.basename(item) not in (".", "..")]
+            logger.info(f"FTP 目录 {remote_path} 下共有 {len(items)} 项（已过滤 . 和 ..）")
+
+            for item in items:
+                item_name = os.path.basename(item)
+                remote_item_path = f"{remote_path}/{item_name}"
+                local_item_path = os.path.join(local_path, item_name)
+
+                # 递归处理每一项
+                _download_recursive(ftp_obj, remote_item_path, local_item_path)
+
+        except error_perm:
+            # cwd 失败，说明是文件，执行下载
+            logger.info(f"正在下载文件: {remote_path}")
+            try:
+                with open(local_path, "wb") as f:
+                    ftp_obj.retrbinary(f"RETR {remote_path}", f.write)
+                logger.info(f"下载完成: {remote_path} → {local_path}")
+            except Exception as e:
+                logger.error(f"下载文件失败: {remote_path}, 错误: {e}")
+                raise
+
+        except Exception as e:
+            logger.error(f"处理 FTP 路径 {remote_path} 时出错: {e}")
+            raise
+
+    # 执行递归下载
+    try:
+        _download_recursive(ftp, remote_dir, local_dir)
+        logger.info(f"版本 {version_folder_name} 全部文件下载完成，本地路径: {local_dir}")
+        return local_dir
+    except Exception as e:
+        logger.error(f"递归下载失败: {e}")
+        raise
 
 
 def _silent_install(local_version_dir: str) -> int:
@@ -334,7 +397,7 @@ app = FastAPI(title="自动化测试触发监听服务", version="2.0")
 
 
 @app.post("/api/trigger/auto-test")
-def trigger_test(task_info: dict):
+def trigger_test(request: Request, task_info: dict):
     """
     接收远程触发请求，执行以下流程：
     1. （默认）检查 FTP 版本，有更新则下载安装
@@ -347,33 +410,56 @@ def trigger_test(task_info: dict):
     """
     global _current_stage
 
-    logger.info(f"收到远程触发请求，入参数据：{task_info}")
+    start_time = time.time()
+    result_dict = None
 
-    # ========== 互斥控制：同一时间只允许处理一个请求 ==========
-    if not _execution_lock.acquire(blocking=False):
-        # 根据当前执行阶段返回不同的提示
-        stage_messages = {
-            ExecutionStage.FTP_CHECKING: ("当前正在检查FTP版本信息，请稍后再试", -10),
-            ExecutionStage.DOWNLOADING: ("当前正在从FTP下载新版本，请稍后再试", -12),
-            ExecutionStage.INSTALLING: ("当前正在静默安装CMGE Copilot新版本，请稍后再试", -13),
-            ExecutionStage.TESTING: ("当前已有测试任务正在执行，请稍后再试", -10),
-        }
-        msg, code = stage_messages.get(
-            _current_stage,
-            ("当前系统忙碌，请稍后再试", -10)
-        )
-        logger.warning(f"请求被拒绝（阶段: {_current_stage.value}）：{msg}，入参：{task_info}")
-        return {
-            "code": code,
-            "msg": msg,
+    # ========== 提取调用方信息（IP / UA / 主机名） ==========
+    client_ip = (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "")
+    )
+    client_host = request.headers.get("host", "")
+    user_agent = request.headers.get("user-agent", "")
+    logger.info(f"收到远程触发请求，调用方IP={client_ip}，UA={user_agent}，入参={task_info}")
+
+    # ========== 异步发送开始通知邮件 ==========
+    threading.Thread(
+        target=mailer.send_call_notification,
+        kwargs={
+            "remote_ip": client_ip or "-",
             "task_info": task_info,
-            "stdout": "",
-            "stderr": msg,
-            "exit_code": -99,
-        }
-    # ========================================================
+            "method": "POST",
+            "path": "/api/trigger/auto-test",
+            "client_host": client_host,
+            "user_agent": user_agent,
+        },
+        daemon=True,
+    ).start()
 
     try:
+        # ========== 互斥控制 ==========
+        if not _execution_lock.acquire(blocking=False):
+            stage_messages = {
+                ExecutionStage.FTP_CHECKING: ("当前正在检查FTP版本信息，请稍后再试", -10),
+                ExecutionStage.DOWNLOADING: ("当前正在从FTP下载新版本，请稍后再试", -12),
+                ExecutionStage.INSTALLING: ("当前正在静默安装CMGE Copilot新版本，请稍后再试", -13),
+                ExecutionStage.TESTING: ("当前已有测试任务正在执行，请稍后再试", -10),
+            }
+            msg, code = stage_messages.get(
+                _current_stage,
+                ("当前系统忙碌，请稍后再试", -10)
+            )
+            logger.warning(f"请求被拒绝（阶段: {_current_stage.value}）：{msg}")
+            result_dict = {
+                "code": code,
+                "msg": msg,
+                "task_info": task_info,
+                "stdout": "",
+                "stderr": msg,
+                "exit_code": -99,
+            }
+            return result_dict
+
         # ========== 解析参数 ==========
         timeout = (task_info.get("timeout", DEFAULT_TIMEOUT_SECONDS)
                    if isinstance(task_info, dict) else DEFAULT_TIMEOUT_SECONDS)
@@ -381,9 +467,9 @@ def trigger_test(task_info: dict):
                       if isinstance(task_info, dict) else False)
 
         if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0:
-            err_msg = f"超时参数timeout无效：{timeout}，必须为正数（单位：秒）"
+            err_msg = f"超时参数timeout无效：{timeout}"
             logger.error(err_msg)
-            return {
+            result_dict = {
                 "code": -1,
                 "msg": f"执行失败：{err_msg}",
                 "task_info": task_info,
@@ -391,14 +477,13 @@ def trigger_test(task_info: dict):
                 "stderr": err_msg,
                 "exit_code": -99,
             }
-        # ================================
+            return result_dict
 
-        # ========== FTP 版本检查与更新（可通过 skip_update 跳过） ==========
+        # ========== FTP 版本检查与更新 ==========
         if not skip_update:
             update_result = _check_and_update_copilot(task_info)
             if update_result["code"] == 1:
-                # 版本相同，不执行测试
-                return {
+                result_dict = {
                     "code": 1,
                     "msg": update_result["msg"],
                     "task_info": task_info,
@@ -408,9 +493,9 @@ def trigger_test(task_info: dict):
                     "stderr": "",
                     "exit_code": 0,
                 }
+                return result_dict
             elif update_result["code"] != 0:
-                # FTP 流程出错，终止
-                return {
+                result_dict = {
                     "code": update_result["code"],
                     "msg": update_result["msg"],
                     "task_info": task_info,
@@ -419,17 +504,16 @@ def trigger_test(task_info: dict):
                     "stderr": update_result["msg"],
                     "exit_code": -99,
                 }
-            # code == 0: 更新成功，继续执行测试
+                return result_dict
             logger.info(f"FTP 更新完成，继续执行测试: {update_result['msg']}")
         else:
-            logger.info("已跳过 FTP 版本检查（skip_update=true），直接执行测试")
-        # ========================================================
+            logger.info("已跳过 FTP 版本检查（skip_update=true）")
 
-        # ========== 前置校验：检查CLI可执行文件 ==========
+        # ========== 前置校验：CLI ==========
         if not os.path.exists(CLI_EXE_PATH):
-            err_msg = f"CLI可执行文件不存在，路径：{CLI_EXE_PATH}"
+            err_msg = f"CLI可执行文件不存在：{CLI_EXE_PATH}"
             logger.error(err_msg)
-            return {
+            result_dict = {
                 "code": -1,
                 "msg": "执行失败：CLI可执行文件不存在",
                 "task_info": task_info,
@@ -437,25 +521,26 @@ def trigger_test(task_info: dict):
                 "stderr": err_msg,
                 "exit_code": -99,
             }
+            return result_dict
 
         if not os.access(CLI_EXE_PATH, os.R_OK):
-            err_msg = f"CLI可执行文件无读取权限，路径：{CLI_EXE_PATH}"
+            err_msg = f"CLI可执行文件无读取权限：{CLI_EXE_PATH}"
             logger.error(err_msg)
-            return {
+            result_dict = {
                 "code": -2,
-                "msg": "执行失败：CLI可执行文件不可读/无执行权限",
+                "msg": "执行失败：CLI可执行文件不可读",
                 "task_info": task_info,
                 "stdout": "",
                 "stderr": err_msg,
                 "exit_code": -99,
             }
-        # ==============================================
+            return result_dict
 
-        # ========== 前置校验：检查用例Excel文件 ==========
+        # ========== 前置校验：用例Excel ==========
         if not os.path.exists(CASES_XLSX_PATH):
-            err_msg = f"用例Excel文件不存在，路径：{CASES_XLSX_PATH}"
+            err_msg = f"用例Excel文件不存在：{CASES_XLSX_PATH}"
             logger.error(err_msg)
-            return {
+            result_dict = {
                 "code": -1,
                 "msg": "执行失败：用例Excel文件不存在",
                 "task_info": task_info,
@@ -463,27 +548,20 @@ def trigger_test(task_info: dict):
                 "stderr": err_msg,
                 "exit_code": -99,
             }
-        # ==============================================
+            return result_dict
 
         # ========== 执行 CLI 测试 ==========
         _current_stage = ExecutionStage.TESTING
-        cmd = [
-            CLI_EXE_PATH,
-            "--cases", CASES_XLSX_PATH
-        ]
-        logger.info(f"开始执行CLI，超时设置：{timeout}秒，命令：{' '.join(cmd)}")
+        cmd = [CLI_EXE_PATH, "--cases", CASES_XLSX_PATH]
+        logger.info(f"开始执行CLI，超时：{timeout}秒，命令：{' '.join(cmd)}")
         try:
-            run_result = subprocess.run(
-                cmd,
-                capture_output=True,
-                timeout=timeout
-            )
+            run_result = subprocess.run(cmd, capture_output=True, timeout=timeout)
         except subprocess.TimeoutExpired as e:
             out = _decode_cli_output(e.stdout)
             err = _decode_cli_output(e.stderr)
             err_msg = f"CLI执行超时，已超过{timeout}秒被强制终止"
             logger.error(f"{err_msg}\n已捕获输出：stdout={out}\nstderr={err}")
-            return {
+            result_dict = {
                 "code": -11,
                 "msg": err_msg,
                 "task_info": task_info,
@@ -491,11 +569,12 @@ def trigger_test(task_info: dict):
                 "stderr": err,
                 "exit_code": -99,
             }
+            return result_dict
+
         stdout_text = _decode_cli_output(run_result.stdout)
         stderr_text = _decode_cli_output(run_result.stderr)
-        log_text = f"CLI执行完成，退出码：{run_result.returncode}\n标准输出：{stdout_text}\n错误输出：{stderr_text}"
-        logger.info(log_text)
-        return {
+        logger.info(f"CLI执行完成，退出码：{run_result.returncode}\n标准输出：{stdout_text}\n错误输出：{stderr_text}")
+        result_dict = {
             "code": 200 if run_result.returncode == 0 else -3,
             "msg": "AutoTestCopilot.CLI执行完毕" if run_result.returncode == 0 else "AutoTestCopilot.CLI执行报错",
             "task_info": task_info,
@@ -503,10 +582,40 @@ def trigger_test(task_info: dict):
             "stderr": stderr_text,
             "exit_code": run_result.returncode,
         }
+        return result_dict
+
+    except Exception as e:
+        logger.error(f"执行过程中发生未预期异常: {e}", exc_info=True)
+        result_dict = {
+            "code": -99,
+            "msg": f"执行过程中发生未预期异常: {str(e)}",
+            "task_info": task_info,
+            "stdout": "",
+            "stderr": str(e),
+            "exit_code": -99,
+        }
+        return result_dict
 
     finally:
         _current_stage = ExecutionStage.IDLE
-        _execution_lock.release()
+        if _execution_lock.locked():
+            _execution_lock.release()
+
+        if result_dict is not None:
+            duration = time.time() - start_time
+            threading.Thread(
+                target=mailer.send_completion_notification,
+                kwargs={
+                    "remote_ip": client_ip or "-",
+                    "task_info": task_info,
+                    "result_code": result_dict.get("code", 0),
+                    "result_msg": result_dict.get("msg", ""),
+                    "stdout": result_dict.get("stdout", ""),
+                    "stderr": result_dict.get("stderr", ""),
+                    "duration_seconds": duration,
+                },
+                daemon=True,
+            ).start()
 
 
 # ==================== 子进程启动 uvicorn 服务 ====================
