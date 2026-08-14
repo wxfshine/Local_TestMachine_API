@@ -2,8 +2,125 @@ Release\AutoTestCopilot.CLI.exe --cases Release\Resources\a.xlsx
 
 curl -v --connect-timeout 5 --max-time 10 -X POST http://127.0.0.1:8080/api/v1/product/notify-finish -H "Authorization: Bearer 1qpfMlhdbyyaWE6oXGqh_6xm-3QNt8ea" -H "Content-Type: application/json" -d '{
   "productId": "PROD-001",
-  "productName": "CMGE Copilot 之改权限为管理员",
+  "productName": "CMGE Copilot 新版本测试",
   "developer": "王晓峰",
-  "finishTime": "2026-07-23 23:23:00",
-  "remark": "第一轮测试完成"
+  "finishTime": "2026-07-27 14:41:05",
+  "remark": "测试完成"
 }'
+
+
+
+1. 如何在测试机上查看 API 是否正常
+a) 在 edge 上查看 localhost:8090/docs
+b) 在 edge 上查看 localhost:8090
+
+2.如何解决输出是乱码的问题
+# 修复 PowerShell 中文显示（每次新开窗口都要执行）
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# 然后正常调用
+$body = @{
+    task_id = "T001"
+    remark  = "触发测试"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body $body
+
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+$body = @{
+    task_id = "T001"
+    remark  = "触发测试"
+} | ConvertTo-Json
+========================================================================
+# 用 Invoke-WebRequest 替代，手动用 UTF-8 解码
+$resp = Invoke-WebRequest -Uri "http://127.0.0.1:8090/api/trigger/auto-test" `
+    -Method Post `
+    -ContentType "application/json" `
+    -Body $body
+
+# 关键：用 UTF-8 解码原始字节
+$jsonStr = [System.Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())
+$result = $jsonStr | ConvertFrom-Json
+$result
+===============================================================================
+如果不想每次都手动设置，可以把编码设置加入 PowerShell 配置文件：
+# 打开 PowerShell 配置文件（没有会自动创建）
+notepad $PROFILE
+
+# 在文件末尾加入这一行：
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+
+
+
+3.测试本地API的用例
+
+| 编号 | 用例名称 | 测试目的 | 请求参数说明 | PowerShell 执行命令 | 预期结果 |
+|:---:|---------|---------|------------|-------------------|---------|
+| TC-001 | 正常调用（含FTP版本检查） | 验证API在正常情况下的完整调用流程：发起POST请求→服务器检查FTP最新版本→下载更新（如有）→执行AutoTestCopilot测试用例→返回执行结果 | task_id: "T001"（必填，唯一任务标识）remark: "正常测试"（可选，备注说明） | 
+$body = @{ task_id = "T001"; remark = "正常测试" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" -Method Post -ContentType "application/json" -Body $body
+
+| 
+① HTTP状态码: 200 
+② code字段: 200 
+③ msg: "AutoTestCopilot.CLI执行完毕" 
+④ exit_code: 0 
+⑤ task_info中包含正确的task_id和remark 
+⑥ 包含previous_version和installed_version 
+⑦ stdout中包含用例执行结果
+ |
+
+
+
+
+| TC-002 | 跳过FTP检查直接执行测试 | 验证设置skip_update=true时，服务器跳过FTP版本检查和新版本下载步骤，直接执行测试用例，适用于本地已更新或无需检查版本的场景 
+| task_id: "T002"（必填）skip_update: true（可选，跳过FTP检查）remark: "跳过检查直接测试" 
+| 
+$body = @{ task_id = "T002"; skip_update = $true; remark = "跳过检查直接测试" } | ConvertTo-Json
+
+Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" 
+-Method Post -ContentType "application/json" -Body $body
+|
+① code: 200 
+② msg: "AutoTestCopilot.CLI执行完毕" 
+③ exit_code: 0 
+④ 不包含previous_version和installed_version字段（跳过了版本检查）
+⑤ stdout中包含用例执行结果 |
+
+
+| TC-003 | 缺少必填参数task_id | 验证缺少必填参数task_id时，服务器是否正确进行参数校验并返回错误信息，防止空任务ID导致后端异常 
+| remark: "缺少task_id"（task_id未传） 
+| 
+$body = @{ remark = "缺少task_id" } \| ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" 
+-Method Post -ContentType "application/json" -Body $body
+
+| 
+① code为非200的错误码 
+② msg或stderr中包含参数校验失败的错误提示 
+③ exit_code为非0的错误码 |
+
+
+| TC-004 | 缺少可选参数remark | 验证不传可选参数remark时，API能否正常处理请求并执行测试，确认remark参数的可选性 | task_id: "T003"（必填）（remark未传） 
+| 
+$body = @{ task_id = "T003" } | ConvertTo-Json
+Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" -Method Post -ContentType "application/json" -Body $body
+① code: 200 
+② msg: "AutoTestCopilot.CLI执行完毕" 
+③ exit_code: 0 
+④ task_info中remark为空或null 
+⑤ 测试用例正常执行 
+
+
+| TC-005 | task_id传入空字符串 | 验证task_id传入空字符串""时的边界处理，确认服务器对空值参数的校验逻辑 | task_id: ""（空字符串）remark: "空task_id测试" | `$body = @{ task_id = ""; remark = "空task_id测试" } \| ConvertTo-Json`<br>`Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" -Method Post -ContentType "application/json" -Body $body` | ① code为非200的错误码 ② msg或stderr中包含task_id为空的错误提示 ③ exit_code为非0的错误码 |
+| TC-006 | skip_update显式设为false | 验证skip_update显式设置为false时，API行为与默认情况（不传skip_update）一致，均执行FTP版本检查流程 | task_id: "T004"（必填）skip_update: false（显式设为false）remark: "显式false测试" | `$body = @{ task_id = "T004"; skip_update = $false; remark = "显式false测试" } \| ConvertTo-Json`<br>`Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" -Method Post -ContentType "application/json" -Body $body` | ① code: 200 ② 行为与TC-001（默认调用）一致 ③ 包含previous_version和installed_version字段 ④ 执行FTP版本检查和更新流程 |
+| TC-007 | 版本未更新时调用 | 验证当FTP上最新版本与当前安装版本相同时，API正确识别无需更新并返回对应状态码，且不执行测试用例 | task_id: "T005"（必填）remark: "版本未更新测试" | `$body = @{ task_id = "T005"; remark = "版本未更新测试" } \| ConvertTo-Json`<br>`Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" -Method Post -ContentType "application/json" -Body $body` | ① code: 1 ② msg: "当前版本已是最新，无需更新，未执行测试" ③ exit_code: 0 ④ 包含current_version和ftp_latest_version，且两者值相同 ⑤ stdout和stderr均为空 ⑥ 未执行测试用例 |
+| TC-008 | 验证响应JSON结构完整性 | 验证成功响应中包含所有预期字段（code、msg、task_info、stdout、stderr、exit_code等），确保响应结构符合接口文档规范 | task_id: "T006"（必填）remark: "结构验证测试" | `$body = @{ task_id = "T006"; remark = "结构验证测试" } \| ConvertTo-Json`<br>`$response = Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" -Method Post -ContentType "application/json" -Body $body`<br>`# 逐字段检查`<br>`$response.PSObject.Properties.Name` | ① 所有字段均存在且不为null：code=200, msg="AutoTestCopilot.CLI执行完毕", task_info完整, stdout含执行输出, stderr为空或警告, exit_code=0 ② 响应为合法JSON ③ 无额外未知字段 |
+| TC-009 | 传入非法JSON格式请求体 | 验证当请求体为非法JSON格式时，服务器的容错处理和错误返回机制 | 请求体: "this is not json"（非法JSON） | `$rawBody = [System.Text.Encoding]::UTF8.GetBytes('this is not json')`<br>`try { $response = Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" -Method Post -ContentType "application/json" -Body $rawBody } catch { Write-Host "异常: $_" }` | ① 服务器正确识别非法JSON ② 返回错误响应（HTTP 400或500）或code为非200的错误码 ③ stderr中包含JSON解析失败的错误信息 |
+| TC-010 | 验证task_info字段透传正确性 | 验证响应中task_info对象内的task_id和remark值与请求体中传入的值完全一致，确保任务信息透传无丢失 | task_id: "TEST_20260814_001" remark: "验证task_info透传" | `$body = @{ task_id = "TEST_20260814_001"; remark = "验证task_info透传" } \| ConvertTo-Json`<br>`$response = Invoke-RestMethod -Uri "http://127.0.0.1:8090/api/trigger/auto-test" -Method Post -ContentType "application/json" -Body $body`<br>`Write-Host "task_id一致: $($response.task_info.task_id -eq 'TEST_20260814_001')"` | ① response.task_info.task_id == "TEST_20260814_001" ② response.task_info.remark == "验证task_info透传" ③ code: 200 ④ exit_code: 0 |
+

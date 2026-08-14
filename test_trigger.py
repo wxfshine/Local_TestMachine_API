@@ -330,6 +330,7 @@ def _check_and_update_copilot(task_info: dict) -> dict:
             return {
                 "code": 1,
                 "msg": "当前版本已是最新，无需更新，未执行测试",
+                "msg_en": "Current version is already up-to-date, no test executed",
                 "current_version": local_version,
                 "ftp_latest_version": ftp_latest,
             }
@@ -369,6 +370,7 @@ def _check_and_update_copilot(task_info: dict) -> dict:
         return {
             "code": 0,
             "msg": f"CMGE Copilot 已成功更新安装至版本: {ftp_latest}" if is_first_install else f"CMGE Copilot 已成功从 {local_version} 更新至 {ftp_latest}",
+            "msg_en": f"CMGE Copilot successfully installed to version: {ftp_latest}" if is_first_install else f"CMGE Copilot successfully updated from {local_version} to {ftp_latest}",
             "previous_version": None if is_first_install else local_version,
             "installed_version": ftp_latest,
         }
@@ -385,6 +387,7 @@ def _check_and_update_copilot(task_info: dict) -> dict:
         return {
             "code": -20,
             "msg": f"FTP 更新流程失败: {str(e)}",
+            "msg_en": f"FTP update flow failed: {str(e)}",
             "error_detail": str(e),
         }
     finally:
@@ -440,19 +443,20 @@ def trigger_test(request: Request, task_info: dict):
         # ========== 互斥控制 ==========
         if not _execution_lock.acquire(blocking=False):
             stage_messages = {
-                ExecutionStage.FTP_CHECKING: ("当前正在检查FTP版本信息，请稍后再试", -10),
-                ExecutionStage.DOWNLOADING: ("当前正在从FTP下载新版本，请稍后再试", -12),
-                ExecutionStage.INSTALLING: ("当前正在静默安装CMGE Copilot新版本，请稍后再试", -13),
-                ExecutionStage.TESTING: ("当前已有测试任务正在执行，请稍后再试", -10),
+                ExecutionStage.FTP_CHECKING: ("当前正在检查FTP版本信息，请稍后再试", "Busy: FTP version check in progress, please retry later", -10),
+                ExecutionStage.DOWNLOADING: ("当前正在从FTP下载新版本，请稍后再试", "Busy: downloading new version from FTP, please retry later", -12),
+                ExecutionStage.INSTALLING: ("当前正在静默安装CMGE Copilot新版本，请稍后再试", "Busy: silent-installing new CMGE Copilot version, please retry later", -13),
+                ExecutionStage.TESTING: ("当前已有测试任务正在执行，请稍后再试", "Busy: a test task is running, please retry later", -10),
             }
-            msg, code = stage_messages.get(
+            msg, msg_en, code = stage_messages.get(
                 _current_stage,
-                ("当前系统忙碌，请稍后再试", -10)
+                ("当前系统忙碌，请稍后再试", "Busy: system busy, please retry later", -10)
             )
             logger.warning(f"请求被拒绝（阶段: {_current_stage.value}）：{msg}")
             result_dict = {
                 "code": code,
                 "msg": msg,
+                "msg_en": msg_en,
                 "task_info": task_info,
                 "stdout": "",
                 "stderr": msg,
@@ -472,6 +476,7 @@ def trigger_test(request: Request, task_info: dict):
             result_dict = {
                 "code": -1,
                 "msg": f"执行失败：{err_msg}",
+                "msg_en": f"Failed: invalid timeout parameter: {timeout}",
                 "task_info": task_info,
                 "stdout": "",
                 "stderr": err_msg,
@@ -486,6 +491,7 @@ def trigger_test(request: Request, task_info: dict):
                 result_dict = {
                     "code": 1,
                     "msg": update_result["msg"],
+                    "msg_en": update_result.get("msg_en", "Version already up-to-date, no test executed"),
                     "task_info": task_info,
                     "current_version": update_result.get("current_version", ""),
                     "ftp_latest_version": update_result.get("ftp_latest_version", ""),
@@ -498,6 +504,7 @@ def trigger_test(request: Request, task_info: dict):
                 result_dict = {
                     "code": update_result["code"],
                     "msg": update_result["msg"],
+                    "msg_en": update_result.get("msg_en", "FTP update flow failed"),
                     "task_info": task_info,
                     "error_detail": update_result.get("error_detail", ""),
                     "stdout": "",
@@ -516,6 +523,7 @@ def trigger_test(request: Request, task_info: dict):
             result_dict = {
                 "code": -1,
                 "msg": "执行失败：CLI可执行文件不存在",
+                "msg_en": f"Failed: CLI executable not found: {CLI_EXE_PATH}",
                 "task_info": task_info,
                 "stdout": "",
                 "stderr": err_msg,
@@ -529,6 +537,7 @@ def trigger_test(request: Request, task_info: dict):
             result_dict = {
                 "code": -2,
                 "msg": "执行失败：CLI可执行文件不可读",
+                "msg_en": f"Failed: CLI executable not readable: {CLI_EXE_PATH}",
                 "task_info": task_info,
                 "stdout": "",
                 "stderr": err_msg,
@@ -543,6 +552,7 @@ def trigger_test(request: Request, task_info: dict):
             result_dict = {
                 "code": -1,
                 "msg": "执行失败：用例Excel文件不存在",
+                "msg_en": f"Failed: cases Excel file not found: {CASES_XLSX_PATH}",
                 "task_info": task_info,
                 "stdout": "",
                 "stderr": err_msg,
@@ -564,6 +574,7 @@ def trigger_test(request: Request, task_info: dict):
             result_dict = {
                 "code": -11,
                 "msg": err_msg,
+                "msg_en": f"CLI execution timeout, force-killed after {timeout}s",
                 "task_info": task_info,
                 "stdout": out,
                 "stderr": err,
@@ -577,6 +588,7 @@ def trigger_test(request: Request, task_info: dict):
         result_dict = {
             "code": 200 if run_result.returncode == 0 else -3,
             "msg": "AutoTestCopilot.CLI执行完毕" if run_result.returncode == 0 else "AutoTestCopilot.CLI执行报错",
+            "msg_en": "AutoTestCopilot.CLI finished" if run_result.returncode == 0 else "AutoTestCopilot.CLI execution error",
             "task_info": task_info,
             "stdout": stdout_text,
             "stderr": stderr_text,
@@ -589,6 +601,7 @@ def trigger_test(request: Request, task_info: dict):
         result_dict = {
             "code": -99,
             "msg": f"执行过程中发生未预期异常: {str(e)}",
+            "msg_en": f"Unexpected exception during execution: {str(e)}",
             "task_info": task_info,
             "stdout": "",
             "stderr": str(e),
